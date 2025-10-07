@@ -1,10 +1,14 @@
-import re
 import os
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.live import Live
+from rich.text import Text
 from provider import OpenAICompatibleClient
-from tools import get_weather, get_attraction
 from tools.available_tools import available_tools
 from prompt.system_prompt import AGENT_SYSTEM_PROMPT
+from agent.parser import truncate_llm_output, parse_action, parse_finish, parse_tool_call
 
 # --- 1. 加载配置 ---
 load_dotenv('config/config.env')
@@ -15,6 +19,8 @@ MODEL_ID = os.getenv('MODEL_ID', '')
 TAVILY_API_KEY = os.getenv('TAVILY_API_KEY', '')
 os.environ['TAVILY_API_KEY'] = TAVILY_API_KEY
 
+console = Console()
+
 llm = OpenAICompatibleClient(
     model=MODEL_ID,
     api_key=API_KEY,
@@ -23,58 +29,83 @@ llm = OpenAICompatibleClient(
 
 # --- 2. 用户交互循环 ---
 while True:
-    user_prompt = input("\n请输入你的问题（输入 exit 退出）: ").strip()
+    user_prompt = Prompt.ask("[bold cyan]请输入你的问题[/bold cyan]").strip()
     if not user_prompt or user_prompt.lower() in ("exit", "quit"):
-        print("再见！")
+        console.print("[bold green]再见！[/bold green]")
         break
 
-    prompt_history = [f"用户请求: {user_prompt}"]
-    print(f"\n用户输入: {user_prompt}\n" + "="*40)
+    console.rule("[bold cyan]新对话[/bold cyan]", style="cyan")
+
+    history: list[dict] = [
+        {"role": "user", "content": user_prompt}
+    ]
+
+    console.print(Panel(
+        f"[white]{user_prompt}[/white]",
+        title="[bold]用户输入[/bold]",
+        border_style="cyan"
+    ))
 
     # --- 3. 运行主循环 ---
-    for i in range(5): # 设置最大循环次数
-        print(f"--- 循环 {i+1} ---\n")
+    for i in range(5):
+        console.rule(f"[bold]第 {i+1} 轮[/bold]", style="dim")
 
-        # 3.1. 构建Prompt
-        full_prompt = "\n".join(prompt_history)
+        messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + history
 
-        # 3.2. 调用LLM进行思考
-        llm_output = llm.generate(full_prompt, system_prompt=AGENT_SYSTEM_PROMPT)
-        # 模型可能会输出多余的Thought-Action，需要截断
-        match = re.search(r'(Thought:.*?Action:.*?)(?=\n\s*(?:Thought:|Action:|Observation:)|\Z)', llm_output, re.DOTALL)
-        if match:
-            truncated = match.group(1).strip()
-            if truncated != llm_output.strip():
-                llm_output = truncated
-                print("已截断多余的 Thought-Action 对")
-        print(f"模型输出:\n{llm_output}\n")
-        prompt_history.append(llm_output)
+        # 3.1 流式调用 LLM
+        collected = ""
+        with Live(
+            Text("思考中...", style="cyan"),
+            refresh_per_second=10,
+            vertical_overflow="visible"
+        ) as live:
+            for token in llm.chat_stream(messages):
+                collected += token
+                live.update(Text(collected))
 
-        # 3.3. 解析并执行行动
-        action_match = re.search(r"Action: (.*)", llm_output, re.DOTALL)
-        if not action_match:
-            observation = "错误: 未能解析到 Action 字段。请确保你的回复严格遵循 'Thought: ... Action: ...' 的格式。"
-            observation_str = f"Observation: {observation}"
-            print(f"{observation_str}\n" + "="*40)
-            prompt_history.append(observation_str)
+        # 3.2 截断多余的 Thought-Action 对
+        collected = truncate_llm_output(collected)
+
+        # 记录本轮 LLM 输出（assistant 角色）
+        history.append({"role": "assistant", "content": collected})
+
+        # 3.3 解析并执行行动
+        action_str = parse_action(collected)
+        if not action_str:
+            console.print(Panel(
+                "[red]错误: 未能解析到 Action 字段。[/red]",
+                title="[red]解析错误[/red]",
+                border_style="red"
+            ))
+            history.append({"role": "user", "content": "Observation: 错误: 未能解析到 Action 字段。"})
             continue
-        action_str = action_match.group(1).strip()
 
         if action_str.startswith("Finish"):
-            final_answer = re.match(r"Finish\[(.*)\]", action_str).group(1)
-            print(f"任务完成，最终答案: {final_answer}")
+            final_answer = parse_finish(action_str)
+            if final_answer:
+                console.print(Panel(
+                    f"[bold green]{final_answer}[/bold green]",
+                    title="[bold green]✓ 最终答案[/bold green]",
+                    border_style="green"
+                ))
             break
 
-        tool_name = re.search(r"(\w+)\(", action_str).group(1)
-        args_str = re.search(r"\((.*)\)", action_str).group(1)
-        kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
+        parsed = parse_tool_call(action_str)
+        if not parsed:
+            history.append({"role": "user", "content": "Observation: 错误: 无法解析工具调用格式。"})
+            continue
+
+        tool_name, kwargs = parsed
 
         if tool_name in available_tools:
+            console.print(f"[yellow]⚡ 调用工具: {tool_name}{kwargs}[/yellow]")
             observation = available_tools[tool_name](**kwargs)
         else:
             observation = f"错误:未定义的工具 '{tool_name}'"
 
-        # 3.4. 记录观察结果
-        observation_str = f"Observation: {observation}"
-        print(f"{observation_str}\n" + "="*40)
-        prompt_history.append(observation_str)
+        console.print(Panel(
+            f"[green]{observation}[/green]",
+            title="[green]📡 观察结果[/green]",
+            border_style="green"
+        ))
+        history.append({"role": "user", "content": f"Observation: {observation}"})
